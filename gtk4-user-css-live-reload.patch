@@ -1,0 +1,147 @@
+--- a/gtk/gtksettings.c
++++ b/gtk/gtksettings.c
+@@ -33,6 +33,7 @@
+ #include "gdk/gdkdisplayprivate.h"
+ 
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #ifdef GDK_WINDOWING_X11
+ #include "x11/gdkx.h"
+@@ -1159,6 +1160,124 @@
+   return new_cascade;
+ }
+ 
++#ifdef G_OS_UNIX
++/* Live reload of the user's gtk.css.
++ *
++ * GTK loads $XDG_CONFIG_HOME/gtk-4.0/gtk.css into one provider when the first
++ * display opens and then never looks at it again, so a theme switch only shows
++ * up in apps you start afterwards. So we watch the file, and when it's a symlink
++ * we also watch whatever it points at. That covers both swapping the link and
++ * rewriting the file behind it. When either one changes we load the same
++ * provider again, the style cascade notices, and every open window restyles,
++ * same as if the app had just started.
++ */
++static GtkCssProvider *user_css_provider = NULL;
++static char *user_css_path = NULL;             /* $XDG_CONFIG_HOME/gtk-4.0/gtk.css */
++static char *user_css_target = NULL;           /* what it resolves to, when a symlink */
++static GFileMonitor *user_css_monitor = NULL;
++static GFileMonitor *user_css_target_monitor = NULL;
++static guint user_css_reload_id = 0;
++
++static void user_css_changed (GFileMonitor      *monitor,
++                              GFile             *file,
++                              GFile             *other_file,
++                              GFileMonitorEvent  event,
++                              gpointer           data);
++
++static GFileMonitor *
++user_css_monitor_path (const char *path)
++{
++  GFile *file = g_file_new_for_path (path);
++  GFileMonitor *monitor = g_file_monitor_file (file, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
++
++  if (monitor)
++    g_signal_connect (monitor, "changed", G_CALLBACK (user_css_changed), NULL);
++
++  g_object_unref (file);
++  return monitor;
++}
++
++static void
++user_css_watch_target (void)
++{
++  char *target = realpath (user_css_path, NULL);
++  GFileMonitor *old;
++
++  if (target && strcmp (target, user_css_path) == 0)
++    {
++      /* plain file, the watch on the path itself already sees writes to it */
++      free (target);
++      target = NULL;
++    }
++
++  if (g_strcmp0 (target, user_css_target) == 0)
++    {
++      free (target);
++      return;
++    }
++
++  /* Start the new watch before dropping the old one. Dropping and recreating a
++   * watch on the same directory in one go left GLib with no kernel watch at all. */
++  old = user_css_target_monitor;
++  user_css_target_monitor = target ? user_css_monitor_path (target) : NULL;
++  g_free (user_css_target);
++  user_css_target = g_strdup (target);
++  free (target);
++  g_clear_object (&old);
++}
++
++static gboolean
++user_css_reload (gpointer data)
++{
++  user_css_reload_id = 0;
++
++  if (g_file_test (user_css_path, G_FILE_TEST_IS_REGULAR))
++    gtk_css_provider_load_from_path (user_css_provider, user_css_path);
++  else
++    gtk_css_provider_load_from_string (user_css_provider, "");
++
++  user_css_watch_target ();
++
++  return G_SOURCE_REMOVE;
++}
++
++static void
++user_css_changed (GFileMonitor      *monitor,
++                  GFile             *file,
++                  GFile             *other_file,
++                  GFileMonitorEvent  event,
++                  gpointer           data)
++{
++  switch (event)
++    {
++    case G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT:
++    case G_FILE_MONITOR_EVENT_CREATED:
++    case G_FILE_MONITOR_EVENT_DELETED:
++    case G_FILE_MONITOR_EVENT_RENAMED:
++    case G_FILE_MONITOR_EVENT_MOVED_IN:
++    case G_FILE_MONITOR_EVENT_MOVED_OUT:
++      break;
++    default:
++      return;
++    }
++
++  /* theme switchers write a few files in a row, so wait for them to finish */
++  if (user_css_reload_id)
++    g_source_remove (user_css_reload_id);
++  user_css_reload_id = g_timeout_add (150, user_css_reload, NULL);
++}
++
++static void
++user_css_watch (GtkCssProvider *provider,
++                char           *path)
++{
++  user_css_provider = provider;
++  user_css_path = path;
++  user_css_monitor = user_css_monitor_path (path);
++  user_css_watch_target ();
++}
++#endif /* G_OS_UNIX */
++
+ static void
+ settings_init_style (GtkSettings *settings)
+ {
+@@ -1206,7 +1325,11 @@
+                        G_FILE_TEST_IS_REGULAR))
+         gtk_css_provider_load_from_path (css_provider, css_path);
+ 
++#ifdef G_OS_UNIX
++      user_css_watch (css_provider, css_path);  /* keeps css_path */
++#else
+       g_free (css_path);
++#endif
+     }
+ 
+   _gtk_style_cascade_add_provider (cascade,

@@ -1,0 +1,6 @@
+arch/
+src/
+pkg/
+repo/
+*.pkg.tar.zst
+*.log

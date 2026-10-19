@@ -1,0 +1,121 @@
+# Keeps gtk4-live-css up to date with Arch's gtk4 so nobody has to touch it.
+#
+# Once a day: compare Arch's current gtk4 version with the one in the committed PKGBUILD.
+# If it changed, or someone ran this by hand with force, build the package in an Arch
+# container, upload it plus a pacman database to the release tagged `repo` (that release
+# is the [saneaspect] repo machines point at) and commit the new PKGBUILD.
+# If the build fails, usually cuz GTK changed the code the patch touches, nothing gets
+# uploaded. Machines stay on the last good version and GitHub mails about the failure.
+name: build
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: build even if Arch's gtk4 version has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: saneaspect
+  RELEASE_TAG: repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      arch: ${{ steps.v.outputs.arch }}
+      ours: ${{ steps.v.outputs.ours }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          arch=$(curl -sf https://archlinux.org/packages/extra/x86_64/gtk4/json/ \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('%s:%s-%s' % (d['epoch'], d['pkgver'], d['pkgrel']))")
+          eval "$(grep -E '^(epoch|pkgver|pkgrel)=' PKGBUILD)"
+          ours="$epoch:$pkgver-$pkgrel"
+          build=false
+          [ "$arch" != "$ours" ] && build=true
+          [ "${{ inputs.force }}" = "true" ] && build=true
+          echo "Arch has gtk4 $arch, we have $ours, build=$build"
+          { echo "arch=$arch"; echo "ours=$ours"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Prepare the container
+        run: |
+          pacman -Syu --noconfirm --needed git python github-cli sudo
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          # skip the -debug package, we only serve one file
+          sed -i 's/^OPTIONS=(\(.*\) debug lto)$/OPTIONS=(\1 !debug lto)/' /etc/makepkg.conf
+          grep -q '!debug' /etc/makepkg.conf
+          sed -i 's|^#PACKAGER=.*|PACKAGER="saneaspect (GitHub Actions)"|' /etc/makepkg.conf
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch Arch's packaging for gtk4 ${{ needs.check.outputs.arch }}
+        run: |
+          v='${{ needs.check.outputs.arch }}'
+          git clone -q --depth 1 --branch "${v/:/-}" \
+            https://gitlab.archlinux.org/archlinux/packaging/packages/gtk4.git arch
+
+      - name: Derive the PKGBUILD
+        run: |
+          python3 derive-pkgbuild.py arch/PKGBUILD > PKGBUILD
+          cp PKGBUILD gtk4-user-css-live-reload.patch arch/
+          mkdir repo
+          chown -R builder: .
+
+      - name: Build
+        working-directory: arch
+        run: sudo -u builder env PKGDEST="$GITHUB_WORKSPACE/repo" makepkg -s --noconfirm
+
+      - name: Make the pacman repository
+        working-directory: repo
+        run: |
+          ls -l
+          repo-add "$REPO_NAME.db.tar.gz" gtk4-live-css-*.pkg.tar.zst
+          # release assets can't be symlinks, so copy the db under both names
+          for f in db files; do rm "$REPO_NAME.$f"; cp "$REPO_NAME.$f.tar.gz" "$REPO_NAME.$f"; done
+          ls -l
+
+      - name: Publish to the release
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" \
+            --title "pacman repository" \
+            --notes "This release is the pacman repo. The README has the pacman.conf lines."
+          gh release upload "$RELEASE_TAG" repo/* --clobber
+          # delete assets the new db doesn't list anymore (the previous package)
+          for a in $(gh release view "$RELEASE_TAG" --json assets -q '.assets[].name'); do
+            [ -e "repo/$a" ] || gh release delete-asset "$RELEASE_TAG" "$a" -y
+          done
+          gh release view "$RELEASE_TAG" --json assets -q '.assets[].name'
+
+      - name: Record the version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD
+          git diff --cached --quiet && exit 0
+          git commit -m "gtk4 ${{ needs.check.outputs.arch }}"
+          git push
